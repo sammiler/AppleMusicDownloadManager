@@ -87,10 +87,10 @@ namespace AppleMusicDownloadManager
 
         private async void StartButton_Click(object sender, RoutedEventArgs e)
         {
-            if (_totalAlbumsDownloadedThisSession >= 10)
+            if (_totalAlbumsDownloadedThisSession >= 100)
             {
-                LogToDecryptor("[会话停止] 累计下载专辑数已达到10张上限！", Brushes.Red);
-                UpdateStatus("专辑总数达到10上限，会话已停止。");
+                LogToDecryptor("[会话停止] 累计下载专辑数已达到100张上限！", Brushes.Red);
+                UpdateStatus("专辑总数达到100上限，会话已停止。");
                 return;
             }
 
@@ -228,10 +228,10 @@ namespace AppleMusicDownloadManager
                     }
 
                     // 4. 检查会话上限
-                    if (_totalAlbumsDownloadedThisSession >= 10)
+                    if (_totalAlbumsDownloadedThisSession >= 100)
                     {
-                        LogToDownloader("[会话停止] 累计下载专辑数已达到10张上限！", Brushes.Red);
-                        UpdateStatus("专辑总数达到10上限，会话已停止。");
+                        LogToDownloader("[会话停止] 累计下载专辑数已达到100张上限！", Brushes.Red);
+                        UpdateStatus("专辑总数达到100上限，会话已停止。");
                         _cancellationTokenSource?.Cancel();
                         break;
                     }
