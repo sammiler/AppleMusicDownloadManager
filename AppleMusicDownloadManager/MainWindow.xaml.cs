@@ -7,6 +7,7 @@ using System.IO;
 using System.Linq;
 using System.Text;
 using System.Text.Json;
+using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Windows;
@@ -29,11 +30,23 @@ namespace AppleMusicDownloadManager
         private string? _baseDirectory; // AMDL-WSL1 路径
         private string? _dbBaseDirectory; // AMData 路径
         private int _totalAlbumsDownloadedThisSession;
+        private string? _failedAlbumStr;
+        private readonly object _logFileLock = new object();
+
+        enum FailedType
+        {
+            NoErr,
+            ValidationErr,
+            NetworkErr,
+            NormalErr
+        }
 
         public MainWindow()
         {
             InitializeComponent();
             CheckEnvironmentVariable();
+            _failedAlbumStr = "placeholder this is test";
+            _totalAlbumsDownloadedThisSession = 0;
         }
 
         private void CheckEnvironmentVariable()
@@ -74,12 +87,18 @@ namespace AppleMusicDownloadManager
 
         private async void StartButton_Click(object sender, RoutedEventArgs e)
         {
+            if (_totalAlbumsDownloadedThisSession >= 10)
+            {
+                LogToDecryptor("[会话停止] 累计下载专辑数已达到10张上限！", Brushes.Red);
+                UpdateStatus("专辑总数达到10上限，会话已停止。");
+                return;
+            }
+
             StartButton.IsEnabled = false;
             StopButton.IsEnabled = true;
             StartButton.Content = "处理中...";
             ClearDownloaderLogs();
             ClearDecryptorLogs();
-            _totalAlbumsDownloadedThisSession = 0;
             _cancellationTokenSource = new CancellationTokenSource();
 
             try
@@ -111,6 +130,7 @@ namespace AppleMusicDownloadManager
             {
                 LogToDecryptor("用户请求终止操作...");
                 LogToDownloader("用户请求终止操作...");
+                KillAllProcesses();
                 _cancellationTokenSource.Cancel();
             }
         }
@@ -121,8 +141,9 @@ namespace AppleMusicDownloadManager
 
             string metadataDbPath = Path.Combine(_dbBaseDirectory, "am_metadata.sqlite");
             string progressDbPath = Path.Combine(_dbBaseDirectory, "download_progress.db");
+            string failedDbPath = Path.Combine(_dbBaseDirectory, "failed_albums.db");
             InitializeProgressDatabase(progressDbPath);
-
+            InitializeFailedAlbumsDatabase(failedDbPath);
             // 启动并监控 Decryptor 进程
             if (!await EnsureDecryptorIsRunning(token))
             {
@@ -161,42 +182,62 @@ namespace AppleMusicDownloadManager
                         continue;
                     }
 
+                    if (IsAlbumFailed(failedDbPath, album.Id) &&
+                        GetAlbumFailedReason(failedDbPath, album.Id) == "FFMPEG ERROR")
+                    {
+                        LogToDownloader($"  ->[跳过-失败] '{album.Name}' (ID: {album.Id}) 已在失败列表中，本次不再重试。",
+                            Brushes.IndianRed);
+                        continue;
+                    }
+
                     ClearDownloaderLogs();
                     UpdateStatus($"正在处理专辑: {album.Name}");
                     LogToDownloader($"[任务开始] 正在下载专辑 '{album.Name}' (URL: {album.Url})");
 
                     // 1. 创建 album.json
                     await CreateAlbumJson(album);
-
                     // 2. 运行下载器
-                    bool success = await RunAndMonitorDownloader(token);
+                    FailedType failedType = await RunAndMonitorDownloader(token);
 
                     // 3. 清理和记录
                     CleanupAlbumJson();
 
-                    if (success)
+                    if (failedType == FailedType.NoErr)
                     {
                         MarkAlbumAsProcessed(progressDbPath, album.Id);
+                        RemoveFailedAlbumIfExists(failedDbPath, album.Id);
                         _totalAlbumsDownloadedThisSession++;
-                        LogToDownloader($"[成功] '{album.Name}' 下载完成。本轮已下载 {_totalAlbumsDownloadedThisSession} 张专辑。",
+                        LogToDecryptor($"[成功] '{album.Name}' 下载完成。本轮已下载 {_totalAlbumsDownloadedThisSession} 张专辑。",
                             Brushes.Green);
                     }
                     else
                     {
-                        LogToDownloader($"[失败] '{album.Name}' 下载失败。请检查 Downloader 日志。", Brushes.Red);
-                        // 可选择：如果失败，是否重试或终止？当前策略是继续下一个
+                        LogToDownloader($"[失败] '{album.Name}' 下载失败。将记录到失败数据库。", Brushes.Red);
+                        // 【新增】调用记录失败任务的方法
+                        string reason = "NormalError";
+                        if (failedType == FailedType.ValidationErr)
+                        {
+                            reason = "FFMPEG ERROR";
+                        }
+                        else if (failedType == FailedType.NetworkErr)
+                        {
+                            reason = "Network ERROR";
+                        }
+
+                        LogFailedAlbum(failedDbPath, reason, album);
                     }
 
                     // 4. 检查会话上限
-                    if (_totalAlbumsDownloadedThisSession >= 500)
+                    if (_totalAlbumsDownloadedThisSession >= 10)
                     {
-                        LogToDownloader("[会话停止] 累计下载专辑数已达到500张上限！", Brushes.Red);
-                        UpdateStatus("专辑总数达到500上限，会话已停止。");
+                        LogToDownloader("[会话停止] 累计下载专辑数已达到10张上限！", Brushes.Red);
+                        UpdateStatus("专辑总数达到10上限，会话已停止。");
                         _cancellationTokenSource?.Cancel();
                         break;
                     }
 
-                    await Task.Delay(5000, token); // 每张专辑之间等待5秒
+                    LogToDecryptor("正在等待下个专辑，10s开始");
+                    await Task.Delay(10000, token); // 每张专辑之间等待10秒
                 }
             }
         }
@@ -241,15 +282,16 @@ namespace AppleMusicDownloadManager
             {
                 LogToDecryptor(data);
                 // 假设 Decryptor 启动后输出特定内容表示就绪
-                if (data.Contains("success", StringComparison.OrdinalIgnoreCase) ||
+                if (data.Contains("listening m3u8 request on", StringComparison.OrdinalIgnoreCase) ||
                     data.Contains("ready", StringComparison.OrdinalIgnoreCase))
                 {
                     decryptorReadyTcs.TrySetResult(true);
                 }
 
-                if (data.ToUpper().Contains("ERROR")) // 左边异常，重启
+                if (data.ToUpper().Contains("ERROR") ||
+                    data.Contains("login failed", StringComparison.OrdinalIgnoreCase)) // 左边异常，重启
                 {
-                    LogToDecryptor("检测到错误，将重启会话...", Brushes.OrangeRed);
+                    LogToDecryptor("检测到错误，将终止会话...", Brushes.OrangeRed);
                     _cancellationTokenSource?.Cancel();
                 }
             }
@@ -269,11 +311,11 @@ namespace AppleMusicDownloadManager
             LogToDecryptor($"Decryptor 已启动 (PID: {_decryptorProcess.Id}). 等待就绪...");
 
             // 等待就绪信号，或超时
-            var completedTask = await Task.WhenAny(decryptorReadyTcs.Task, Task.Delay(TimeSpan.FromSeconds(30), token));
+            var completedTask =
+                await Task.WhenAny(decryptorReadyTcs.Task, Task.Delay(TimeSpan.FromSeconds(300), token));
             if (completedTask != decryptorReadyTcs.Task || !decryptorReadyTcs.Task.Result)
             {
-                LogToDecryptor("Decryptor 未能在30秒内进入就绪状态。", Brushes.Red);
-                KillProcess(_decryptorProcess);
+                LogToDecryptor("Decryptor 未能在300秒内进入就绪状态。", Brushes.Red);
                 return false;
             }
 
@@ -281,14 +323,14 @@ namespace AppleMusicDownloadManager
             return true;
         }
 
-        private async Task<bool> RunAndMonitorDownloader(CancellationToken token)
+        private async Task<FailedType> RunAndMonitorDownloader(CancellationToken token)
         {
             var batFile = Path.Combine(_baseDirectory!, "2. Run downloader.bat");
             if (!File.Exists(batFile))
             {
                 MessageBox.Show("错误: 找不到 '2. Run downloader.bat' 启动脚本。", "文件未找到", MessageBoxButton.OK,
                     MessageBoxImage.Error);
-                return false;
+                return FailedType.NormalErr;
             }
 
             var startInfo = new ProcessStartInfo
@@ -303,53 +345,83 @@ namespace AppleMusicDownloadManager
             };
 
             _downloaderProcess = new Process { StartInfo = startInfo, EnableRaisingEvents = true };
-            var outputTcs = new TaskCompletionSource<bool>();
+            var outputTcs = new TaskCompletionSource<FailedType>();
+
+            // 使用 StringBuilder 收集所有日志，以便在需要时进行分析
+            var processOutputLog = new StringBuilder();
 
             void HandleOutput(string data)
             {
+                if (string.IsNullOrEmpty(data)) return;
+
                 LogToDownloader(data);
+                processOutputLog.AppendLine(data); // 收集所有日志
+
+                // 【核心逻辑】根据日志内容实时判断并设置最终结果
                 if (data.Contains("Exit Finished!"))
                 {
-                    outputTcs.TrySetResult(true);
+                    outputTcs.TrySetResult(FailedType.NoErr);
                 }
-                else if (data.ToUpper().Contains("[FAILURE]") || data.ToUpper().Contains("CRITICAL ERROR"))
+                else if (data.Contains("[FAILURE] FFMPEG validation failed"))
                 {
-                    outputTcs.TrySetResult(false);
+                    outputTcs.TrySetResult(FailedType.ValidationErr);
+                }
+                else if (data.Contains("=======  [✔ ] Completed:") && data.Contains("Errors:"))
+                {
+                    try
+                    {
+                        // 使用正则表达式精确匹配 "Errors: X" 部分
+                        Match match = Regex.Match(data, @"Errors:\s*(\d+)");
+                        if (match.Success)
+                        {
+                            int errorCount = int.Parse(match.Groups[1].Value);
+                            if (errorCount > 0)
+                            {
+                                outputTcs.TrySetResult(FailedType.NetworkErr);
+                            }
+                            // 注意：如果 errorCount 是 0，我们不在这里设置成功，等待 "Exit Finished!" 信号
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        LogToDownloader($"解析错误计数失败: {ex.Message}", Brushes.OrangeRed);
+                    }
+                }
+                else if (data.ToUpper().Contains("CRITICAL ERROR") ||
+                         (_failedAlbumStr != null && data.Contains(_failedAlbumStr)))
+                {
+                    outputTcs.TrySetResult(FailedType.NormalErr);
                 }
             }
 
-            _downloaderProcess.OutputDataReceived += (s, e) =>
-            {
-                if (e.Data != null) HandleOutput(e.Data);
-            };
-            _downloaderProcess.ErrorDataReceived += (s, e) =>
-            {
-                if (e.Data != null) HandleOutput(e.Data);
-            };
+            _downloaderProcess.OutputDataReceived += (s, e) => HandleOutput(e.Data);
+            _downloaderProcess.ErrorDataReceived += (s, e) => HandleOutput(e.Data);
 
             _downloaderProcess.Start();
             _downloaderProcess.BeginOutputReadLine();
             _downloaderProcess.BeginErrorReadLine();
             LogToDownloader($"Downloader 进程已启动 (PID: {_downloaderProcess.Id}).");
 
+            // 等待来自日志的明确信号 或 进程自己退出
             Task processExitTask = _downloaderProcess.WaitForExitAsync(token);
-            Task completedTask = await Task.WhenAny(outputTcs.Task, processExitTask);
+            await Task.WhenAny(outputTcs.Task, processExitTask);
 
-            bool success;
-            if (completedTask == outputTcs.Task)
+            // 无论哪个任务先完成，都确保进程被终止
+            KillProcess(_downloaderProcess);
+
+            // 【最终裁决】
+            if (outputTcs.Task.IsCompleted)
             {
-                success = await outputTcs.Task;
+                // 我们从日志中收到了明确的信号，以此为准
+                return await outputTcs.Task;
             }
             else
             {
-                // 进程退出了，但没有收到明确的成功/失败信号
-                success = _downloaderProcess.ExitCode == 0;
-                LogToDownloader($"Downloader 进程已退出，退出码: {_downloaderProcess.ExitCode}。判定结果: {(success ? "成功" : "失败")}",
-                    success ? Brushes.Gray : Brushes.Red);
+                // 进程退出了，但我们没收到任何明确信号。
+                // 这通常意味着出错了，比如脚本崩溃。
+                LogToDownloader("进程意外退出，未收到明确的成功或失败信号。判定为普通错误。", Brushes.Red);
+                return FailedType.NormalErr;
             }
-
-            KillProcess(_downloaderProcess); // 确保进程被清理
-            return success;
         }
 
         private void KillProcess(Process? process)
@@ -367,10 +439,53 @@ namespace AppleMusicDownloadManager
 
         private void KillAllProcesses()
         {
+            // 步骤 1: 终止 C# 这边管理的 downloader 进程对象
             KillProcess(_downloaderProcess);
             _downloaderProcess = null;
             KillProcess(_decryptorProcess);
             _decryptorProcess = null;
+            // 步骤 2: 【关键】执行 WSL 内部的深度清理
+            if (string.IsNullOrEmpty(_baseDirectory)) return;
+
+            try
+            {
+                // 构建 pkill 命令，严格按照您的参考代码逻辑
+                // pkill -f 会根据进程的完整命令行进行匹配
+                // 'wrapper' 会匹配 "cd && ./wrapper -L 'U:P'"
+                // 'controller.py' 会匹配 "python3 -u controller.py"
+                // 使用分号确保两条命令都会执行
+                string cleanupCommand = "pkill -f 'wrapper'; pkill -f 'controller.py'";
+
+                LogToDecryptor($"[清理] 正在 WSL 内部执行: {cleanupCommand}", Brushes.Orange);
+
+                var processInfo = new ProcessStartInfo
+                {
+                    // 使用 LxRunOffline.exe 执行 WSL 命令
+                    FileName = Path.Combine(_baseDirectory, "wsl1", "LxRunOffline.exe"),
+
+                    // 传入参数：r(run), -n u22-amdl (指定发行版), -c "命令"
+                    Arguments = $"r -n u22-amdl -c \"{cleanupCommand}\"",
+
+                    UseShellExecute = false,
+                    CreateNoWindow = true,
+                    WindowStyle = ProcessWindowStyle.Hidden
+                };
+
+                // 启动清理进程并等待它完成
+                using var cleanupProcess = Process.Start(processInfo);
+                cleanupProcess?.WaitForExit(10000); // 等待最多10秒
+            }
+            catch (Exception ex)
+            {
+                // 在 UI 线程上安全地更新状态栏
+                Dispatcher.BeginInvoke(() => UpdateStatus($"WSL cleanup failed: {ex.Message}"));
+            }
+            finally
+            {
+                // 步骤 3: 无论 WSL 清理是否成功，最后都尝试终止 C# 这边的 decryptor 进程对象
+                KillProcess(_decryptorProcess);
+                _decryptorProcess = null;
+            }
         }
 
         #endregion
@@ -418,6 +533,54 @@ namespace AppleMusicDownloadManager
                 new SQLiteCommand(
                     "CREATE TABLE IF NOT EXISTS processed_albums (album_id TEXT PRIMARY KEY, processed_at TEXT)", con);
             cmd.ExecuteNonQuery();
+        }
+
+        private void InitializeFailedAlbumsDatabase(string dbPath)
+        {
+            using var con = new SQLiteConnection($"Data Source={dbPath};Version=3;");
+            con.Open();
+            string sql = @"
+                        CREATE TABLE IF NOT EXISTS failed_tasks (
+                            album_id TEXT PRIMARY KEY, 
+                            album_name TEXT,
+                            album_url TEXT,
+                            reason TEXT,
+                            failed_at TEXT
+                        )";
+            using var cmd = new SQLiteCommand(sql, con);
+            cmd.ExecuteNonQuery();
+        }
+
+        private void RemoveFailedAlbumIfExists(string failedDbPath, string albumId)
+        {
+            // 检查失败数据库文件是否存在，如果不存在就没必要继续了
+            if (!File.Exists(failedDbPath)) return;
+
+            try
+            {
+                using var con = new SQLiteConnection($"Data Source={failedDbPath};Version=3;");
+                con.Open();
+
+                // 准备 DELETE 语句，根据 album_id 删除记录
+                string sql = "DELETE FROM failed_tasks WHERE album_id = @id";
+
+                using var cmd = new SQLiteCommand(sql, con);
+                cmd.Parameters.AddWithValue("@id", albumId);
+
+                // 执行命令。如果不存在匹配的记录，ExecuteNonQuery 不会报错，只会返回 0。
+                int rowsAffected = cmd.ExecuteNonQuery();
+
+                // （可选日志）如果确实删除了记录，可以打印一条日志确认
+                if (rowsAffected > 0)
+                {
+                    LogToDownloader($"  -> 已从失败记录中移除专辑: {albumId}", Brushes.DarkGray);
+                }
+            }
+            catch (Exception ex)
+            {
+                // 即使删除失败，也不应该影响主流程，只记录错误即可
+                LogToDownloader($"从失败记录中移除专辑 {albumId} 时出错: {ex.Message}", Brushes.OrangeRed);
+            }
         }
 
         private List<string>? GetAllArtistIds(string metadataDbPath)
@@ -513,6 +676,62 @@ namespace AppleMusicDownloadManager
             }
         }
 
+        private bool IsAlbumFailed(string failedDbPath, string albumId)
+        {
+            // 如果失败数据库文件本身就不存在，那里面肯定没有任何记录
+            if (!File.Exists(failedDbPath)) return false;
+
+            try
+            {
+                using var con = new SQLiteConnection($"Data Source={failedDbPath};Version=3;");
+                con.Open();
+
+                // 查询 failed_tasks 表中是否存在对应的 album_id
+                using var cmd = new SQLiteCommand("SELECT 1 FROM failed_tasks WHERE album_id = @id", con);
+                cmd.Parameters.AddWithValue("@id", albumId);
+
+                // cmd.ExecuteScalar() != null 会在找到记录时返回 true，否则返回 false
+                return cmd.ExecuteScalar() != null;
+            }
+            catch (Exception ex)
+            {
+                // 如果查询时发生错误，为了安全起见，我们假设它没有失败，
+                // 让主流程有机会去处理它。同时记录下错误。
+                LogToDownloader($"查询失败记录时出错: {ex.Message}", Brushes.OrangeRed);
+                return false;
+            }
+        }
+
+        private string? GetAlbumFailedReason(string failedDbPath, string albumId)
+        {
+            // 如果失败数据库文件不存在，直接返回 null
+            if (!File.Exists(failedDbPath)) return null;
+
+            try
+            {
+                using var con = new SQLiteConnection($"Data Source={failedDbPath};Version=3;");
+                con.Open();
+
+                // 查询 failed_tasks 表中指定 album_id 的 reason 字段
+                using var cmd = new SQLiteCommand("SELECT reason FROM failed_tasks WHERE album_id = @id", con);
+                cmd.Parameters.AddWithValue("@id", albumId);
+
+                // ExecuteScalar 会返回查询结果的第一行第一列的值
+                // 如果没有找到记录，它会返回 null
+                object? result = cmd.ExecuteScalar();
+
+                // 将结果转换为字符串。如果结果是 null，ToString() 会抛出异常，
+                // 所以我们使用 C# 的模式匹配或条件转换来安全地处理。
+                return result?.ToString();
+            }
+            catch (Exception ex)
+            {
+                // 如果查询时发生错误，记录日志并返回 null
+                LogToDownloader($"查询失败原因时出错: {ex.Message}", Brushes.OrangeRed);
+                return null;
+            }
+        }
+
         private void MarkAlbumAsProcessed(string progressDbPath, string albumId)
         {
             try
@@ -529,6 +748,29 @@ namespace AppleMusicDownloadManager
             catch (Exception ex)
             {
                 LogToDownloader($"标记专辑 '{albumId}' 为已处理时失败: {ex.Message}", Brushes.Red);
+            }
+        }
+
+        private void LogFailedAlbum(string failedDbPath, string reason, AlbumInfo album)
+        {
+            try
+            {
+                using var con = new SQLiteConnection($"Data Source={failedDbPath};Version=3;");
+                con.Open();
+                string sql = @"
+        INSERT OR REPLACE INTO failed_tasks (album_id, album_name, album_url, reason,failed_at) 
+        VALUES (@id, @name, @url, @reason,@time)";
+                using var cmd = new SQLiteCommand(sql, con);
+                cmd.Parameters.AddWithValue("@id", album.Id);
+                cmd.Parameters.AddWithValue("@name", album.Name);
+                cmd.Parameters.AddWithValue("@url", album.Url);
+                cmd.Parameters.AddWithValue("@reason", reason);
+                cmd.Parameters.AddWithValue("@time", DateTime.Now.ToString("s"));
+                cmd.ExecuteNonQuery();
+            }
+            catch (Exception ex)
+            {
+                LogToDownloader($"记录失败任务到数据库时出错: {ex.Message}", Brushes.OrangeRed);
             }
         }
 
@@ -555,7 +797,37 @@ namespace AppleMusicDownloadManager
         }
 
         private void LogToDecryptor(string message, Brush? color = null) => LogTo(DecryptorLogRtb, message, color);
-        private void LogToDownloader(string message, Brush? color = null) => LogTo(DownloaderLogRtb, message, color);
+
+        private void LogToDownloader(string message, Brush? color = null)
+        {
+            // 1. 首先，执行原来的操作：将日志显示在界面上
+            LogTo(DownloaderLogRtb, message, color);
+
+            // 2. 【新增】然后，将日志消息写入到文件中
+            try
+            {
+                // 确保数据库/日志目录路径有效
+                if (!string.IsNullOrEmpty(_dbBaseDirectory))
+                {
+                    // 构造完整的日志文件路径
+                    string logFilePath = Path.Combine(_dbBaseDirectory, "download.log");
+
+                    // 使用 lock 确保同一时间只有一个线程可以写入文件，避免冲突
+                    lock (_logFileLock)
+                    {
+                        // 将消息追加到文件末尾，并添加一个换行符
+                        // File.AppendAllText 会自动创建文件（如果不存在）
+                        File.AppendAllText(logFilePath, message + Environment.NewLine);
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                // 如果写入日志文件失败（例如权限问题），我们不希望程序崩溃。
+                // 只是在调试输出中打印一个错误，以便开发者可以看到。
+                System.Diagnostics.Debug.WriteLine($"[ERROR] Failed to write to download.log: {ex.Message}");
+            }
+        }
 
         private void ClearLogs(RichTextBox rtb)
         {
