@@ -394,8 +394,14 @@ namespace AppleMusicDownloadManager
                 }
             }
 
-            _downloaderProcess.OutputDataReceived += (s, e) => HandleOutput(e.Data);
-            _downloaderProcess.ErrorDataReceived += (s, e) => HandleOutput(e.Data);
+            _downloaderProcess.OutputDataReceived += (s, e) =>
+            {
+                if (e.Data != null) HandleOutput(e.Data);
+            };
+            _downloaderProcess.ErrorDataReceived += (s, e) =>
+            {
+                if (e.Data != null) HandleOutput(e.Data);
+            };
 
             _downloaderProcess.Start();
             _downloaderProcess.BeginOutputReadLine();
