@@ -38,6 +38,7 @@ namespace AppleMusicDownloadManager
             NoErr,
             ValidationErr,
             NetworkErr,
+            AlacErr,
             NormalErr
         }
 
@@ -183,7 +184,8 @@ namespace AppleMusicDownloadManager
                     }
 
                     if (IsAlbumFailed(failedDbPath, album.Id) &&
-                        GetAlbumFailedReason(failedDbPath, album.Id) == "FFMPEG ERROR")
+                        (GetAlbumFailedReason(failedDbPath, album.Id) == "FFMPEG ERROR" ||
+                         GetAlbumFailedReason(failedDbPath, album.Id) == "Alac ERROR"))
                     {
                         LogToDownloader($"  ->[跳过-失败] '{album.Name}' (ID: {album.Id}) 已在失败列表中，本次不再重试。",
                             Brushes.IndianRed);
@@ -222,6 +224,10 @@ namespace AppleMusicDownloadManager
                         else if (failedType == FailedType.NetworkErr)
                         {
                             reason = "Network ERROR";
+                        }
+                        else if (failedType == FailedType.AlacErr)
+                        {
+                            reason = "Alac ERROR";
                         }
 
                         LogFailedAlbum(failedDbPath, reason, album);
@@ -391,6 +397,10 @@ namespace AppleMusicDownloadManager
                          (_failedAlbumStr != null && data.Contains(_failedAlbumStr)))
                 {
                     outputTcs.TrySetResult(FailedType.NormalErr);
+                }
+                else if (data.Contains("Unavailable, trying to dl aac-lc"))
+                {
+                    outputTcs.TrySetResult(FailedType.AlacErr);
                 }
             }
 
