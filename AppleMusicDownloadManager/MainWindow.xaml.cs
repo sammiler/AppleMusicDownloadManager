@@ -407,7 +407,8 @@ namespace AppleMusicDownloadManager
                 {
                     outputTcs.TrySetResult(FailedType.AlacErr);
                 }
-                else if (data.Contains("Completed: 0/0"))
+                else if (data.Contains("Failed to get album response") ||
+                         data.Contains("Failed to rip album"))
                 {
                     outputTcs.TrySetResult(FailedType.FatalERR);
                 }
