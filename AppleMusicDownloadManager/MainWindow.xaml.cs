@@ -39,7 +39,8 @@ namespace AppleMusicDownloadManager
             ValidationErr,
             NetworkErr,
             AlacErr,
-            NormalErr
+            NormalErr,
+            FatalERR
         }
 
         public MainWindow()
@@ -229,6 +230,10 @@ namespace AppleMusicDownloadManager
                         {
                             reason = "Alac ERROR";
                         }
+                        else if (failedType == FailedType.FatalERR)
+                        {
+                            reason = "Fatal ERROR";
+                        }
 
                         LogFailedAlbum(failedDbPath, reason, album);
                     }
@@ -401,6 +406,10 @@ namespace AppleMusicDownloadManager
                 else if (data.Contains("Unavailable, trying to dl aac-lc"))
                 {
                     outputTcs.TrySetResult(FailedType.AlacErr);
+                }
+                else if (data.Contains("Completed: 0/0"))
+                {
+                    outputTcs.TrySetResult(FailedType.FatalERR);
                 }
             }
 
