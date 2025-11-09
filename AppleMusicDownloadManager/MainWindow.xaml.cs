@@ -237,19 +237,19 @@ namespace AppleMusicDownloadManager
 
                         LogFailedAlbum(failedDbPath, reason, album);
                     }
-
-                    // 4. 检查会话上限
-                    if (_totalAlbumsDownloadedThisSession >= 100)
-                    {
-                        LogToDownloader("[会话停止] 累计下载专辑数已达到100张上限！", Brushes.Red);
-                        UpdateStatus("专辑总数达到100上限，会话已停止。");
-                        _cancellationTokenSource?.Cancel();
-                        break;
-                    }
-
-                    LogToDecryptor("正在等待下个专辑，10s开始");
-                    await Task.Delay(10000, token); // 每张专辑之间等待10秒
                 }
+
+                // 4. 检查会话上限
+                if (_totalAlbumsDownloadedThisSession >= 100)
+                {
+                    LogToDownloader("[会话停止] 累计下载专辑数已达到100张上限！", Brushes.Red);
+                    UpdateStatus("专辑总数达到100上限，会话已停止。");
+                    _cancellationTokenSource?.Cancel();
+                    break;
+                }
+
+                LogToDecryptor("正在等待下个专辑，10s开始");
+                await Task.Delay(10000, token); // 每张专辑之间等待10秒
             }
         }
 
