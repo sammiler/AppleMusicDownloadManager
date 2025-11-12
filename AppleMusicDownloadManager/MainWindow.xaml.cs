@@ -212,6 +212,8 @@ namespace AppleMusicDownloadManager
                         _totalAlbumsDownloadedThisSession++;
                         LogToDecryptor($"[成功] '{album.Name}' 下载完成。本轮已下载 {_totalAlbumsDownloadedThisSession} 张专辑。",
                             Brushes.Green);
+                        LogToDecryptor("正在等待下个专辑，10s开始");
+                        await Task.Delay(10000, token); // 每张专辑之间等待10秒
                     }
                     else
                     {
@@ -247,9 +249,6 @@ namespace AppleMusicDownloadManager
                     _cancellationTokenSource?.Cancel();
                     break;
                 }
-
-                LogToDecryptor("正在等待下个专辑，10s开始");
-                await Task.Delay(10000, token); // 每张专辑之间等待10秒
             }
         }
 
